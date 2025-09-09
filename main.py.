@@ -1,1 +1,100 @@
 
+from fastapi import FastAPI, UploadFile, Request, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+import uvicorn
+import subprocess
+import whisper
+import os
+import uuid
+
+app = FastAPI()
+
+# Permitir chamadas externas (ex: Lovable)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Pastas para salvar arquivos
+os.makedirs("uploads", exist_ok=True)
+os.makedirs("outputs", exist_ok=True)
+
+# Servir vídeos finais publicamente
+app.mount("/outputs", StaticFiles(directory="outputs"), name="outputs")
+
+# Carregar modelo Whisper (pode trocar "small" -> "tiny" se o servidor for fraco)
+model = whisper.load_model("small")
+
+def format_timestamp(s):
+    h = int(s // 3600)
+    m = int((s % 3600) // 60)
+    sec = int(s % 60)
+    ms = int((s - int(s)) * 1000)
+    return f"{h:02d}:{m:02d}:{sec:02d},{ms:03d}"
+
+def add_emojis_and_style(text):
+    t = text
+    lower = t.lower()
+    if "amor" in lower:
+        t = "❤️ " + t
+    if "porta" in lower:
+        t = t + " 🚪"
+    if "força" in lower:
+        t = t + " 💪🔥"
+    if "fogo" in lower:
+        t = t + " 🔥"
+    return t
+
+@app.post("/legendar")
+async def legendar(request: Request, video: UploadFile):
+    # Salvar vídeo enviado
+    filename = f"{uuid.uuid4().hex}_{video.filename.replace(' ','_')}"
+    input_path = os.path.join("uploads", filename)
+    with open(input_path, "wb") as f:
+        f.write(await video.read())
+
+    # Extrair áudio
+    audio_path = os.path.join("uploads", f"audio_{uuid.uuid4().hex}.wav")
+    cmd_audio = ["ffmpeg", "-y", "-i", input_path, "-ar", "16000", "-ac", "1", audio_path]
+    proc = subprocess.run(cmd_audio, capture_output=True)
+    if proc.returncode != 0:
+        raise HTTPException(status_code=500, detail="Erro ao extrair áudio")
+
+    # Transcrever com Whisper
+    result = model.transcribe(audio_path)
+    segments = result.get("segments", [])
+
+    # Criar legendas SRT
+    srt_name = f"legendas_{uuid.uuid4().hex}.srt"
+    srt_path = os.path.join("uploads", srt_name)
+    with open(srt_path, "w", encoding="utf-8") as f:
+        for i, seg in enumerate(segments, start=1):
+            start = format_timestamp(seg["start"])
+            end = format_timestamp(seg["end"])
+            text = add_emojis_and_style(seg["text"].strip())
+            f.write(f"{i}\n")
+            f.write(f"{start} --> {end}\n")
+            f.write(f"{text}\n\n")
+
+    # Renderizar vídeo com legendas
+    out_filename = f"legendado_{uuid.uuid4().hex}_{video.filename.replace(' ','_')}"
+    output_path = os.path.join("outputs", out_filename)
+    cmd_render = [
+        "ffmpeg", "-y", "-i", input_path,
+        "-vf", f"subtitles={srt_path}:force_style='FontName=Arial,Fontsize=28,PrimaryColour=&H00FF00&'",
+        "-c:a", "copy", output_path
+    ]
+    proc2 = subprocess.run(cmd_render, capture_output=True)
+    if proc2.returncode != 0:
+        raise HTTPException(status_code=500, detail="Erro ao renderizar vídeo")
+
+    # URL final para baixar no Lovable
+    base = str(request.base_url).rstrip("/")
+    return {"status": "ok", "download_url": f"{base}/outputs/{os.path.basename(output_path)}"}
+
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
